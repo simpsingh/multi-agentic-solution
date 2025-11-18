@@ -1,0 +1,446 @@
+"""
+Document Processing Component
+
+Natural language interface for end-to-end document processing.
+"""
+
+import gradio as gr
+import httpx
+import os
+import re
+import json
+import time
+from datetime import datetime
+from typing import Optional, Tuple, Dict, List
+
+AIRFLOW_URL = os.getenv("AIRFLOW_URL", "http://airflow:8080")
+AIRFLOW_ADMIN_USER = os.getenv("AIRFLOW_ADMIN_USER", "admin")
+AIRFLOW_ADMIN_PASSWORD = os.getenv("AIRFLOW_ADMIN_PASSWORD", "admin")
+S3_BUCKET_NAME = os.getenv("S3_BUCKET_NAME", "ses-v1")
+S3_INPUT_PREFIX = os.getenv("S3_INPUT_PREFIX", "input/")
+
+# Task display names
+TASK_NAMES = {
+    "task1_verify_endpoints": "Verify endpoint connections",
+    "task2_verify_s3_access": "Verify S3 bucket access",
+    "task3_verify_containers": "Verify docker containers",
+    "task4_fetch_document": "Fetch document from S3",
+    "task5_parse_document": "Parse document and extract metadata",
+}
+
+# Task list for ordered display
+TASK_ORDER = [
+    "task1_verify_endpoints",
+    "task2_verify_s3_access",
+    "task3_verify_containers",
+    "task4_fetch_document",
+    "task5_parse_document"
+]
+
+# Status emojis
+STATUS_ICONS = {
+    "success": "✓",
+    "running": "⋯",
+    "failed": "✗",
+    "queued": "○",
+    "pending": "○",
+    "upstream_failed": "✗",
+    "skipped": "−",
+}
+
+
+def parse_document_name(user_input: str) -> Optional[str]:
+    """
+    Extract document name from natural language input.
+
+    Examples:
+    - "Start processing xyz.docx" -> "xyz.docx"
+    - "Process the Fintrac_Swift_Source_Extract_Specification_v4_plus_appendix.docx" -> "Fintrac_Swift_Source_Extract_Specification_v4_plus_appendix.docx"
+    - "Analyze my_document.pdf" -> "my_document.pdf"
+
+    Args:
+        user_input: Natural language input from user
+
+    Returns:
+        Document filename or None
+    """
+    # Pattern to match filenames with extensions
+    pattern = r'\b([A-Za-z0-9_\-+]+\.(docx|doc|pdf|txt))\b'
+    match = re.search(pattern, user_input, re.IGNORECASE)
+
+    if match:
+        return match.group(1)
+
+    return None
+
+
+def trigger_airflow_dag(document_name: str) -> Tuple[bool, str, dict]:
+    """
+    Trigger Airflow doc_processor DAG.
+
+    Args:
+        document_name: Name of document in S3 bucket
+
+    Returns:
+        Tuple of (success, message, dag_run_info)
+    """
+    try:
+        # Generate job ID
+        job_id = f"job_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+        # Construct S3 key
+        s3_key = f"{S3_INPUT_PREFIX}{document_name}"
+
+        # DAG run configuration
+        dag_config = {
+            "job_id": job_id,
+            "document_name": document_name,
+            "s3_bucket": S3_BUCKET_NAME,
+            "s3_key": s3_key,
+            "command": "parse_document"
+        }
+
+        # Trigger DAG via Airflow REST API
+        url = f"{AIRFLOW_URL}/api/v1/dags/doc_processor/dagRuns"
+
+        with httpx.Client(timeout=30.0) as client:
+            response = client.post(
+                url,
+                json={
+                    "conf": dag_config,
+                    "dag_run_id": f"manual_{job_id}",
+                },
+                auth=(AIRFLOW_ADMIN_USER, AIRFLOW_ADMIN_PASSWORD),
+                headers={"Content-Type": "application/json"},
+            )
+
+            if response.status_code in [200, 201]:
+                result = response.json()
+                return True, f"DAG triggered successfully!\n\nJob ID: {job_id}\nDAG Run ID: {result.get('dag_run_id')}\nDocument: {document_name}\nS3 Location: s3://{S3_BUCKET_NAME}/{s3_key}", result
+            else:
+                return False, f"Failed to trigger DAG: {response.status_code} - {response.text}", {}
+
+    except Exception as e:
+        return False, f"Error triggering DAG: {str(e)}", {}
+
+
+def get_task_instances(dag_run_id: str) -> Dict[str, str]:
+    """
+    Get task instance states for a DAG run.
+
+    Args:
+        dag_run_id: DAG run identifier
+
+    Returns:
+        Dictionary mapping task_id to state
+    """
+    try:
+        url = f"{AIRFLOW_URL}/api/v1/dags/doc_processor/dagRuns/{dag_run_id}/taskInstances"
+
+        with httpx.Client(timeout=30.0) as client:
+            response = client.get(
+                url,
+                auth=(AIRFLOW_ADMIN_USER, AIRFLOW_ADMIN_PASSWORD),
+            )
+
+            if response.status_code == 200:
+                result = response.json()
+                task_instances = result.get("task_instances", [])
+
+                return {
+                    task["task_id"]: task.get("state", "pending")
+                    for task in task_instances
+                }
+            else:
+                return {}
+
+    except Exception as e:
+        return {}
+
+
+def format_progress(task_states: Dict[str, str]) -> str:
+    """
+    Format task progress in Claude-style (no flickering).
+
+    Args:
+        task_states: Dictionary mapping task_id to state
+
+    Returns:
+        Formatted progress string
+    """
+    if not task_states:
+        return "Initializing..."
+
+    lines = []
+    for task_id in TASK_ORDER:
+        state = task_states.get(task_id, "pending")
+        icon = STATUS_ICONS.get(state, "○")
+        task_name = TASK_NAMES.get(task_id, task_id)
+
+        lines.append(f"{icon} {task_name}")
+
+    return "\n".join(lines)
+
+
+def calculate_completion_percentage(task_states: Dict[str, str]) -> int:
+    """
+    Calculate completion percentage based on task states.
+
+    Args:
+        task_states: Dictionary mapping task_id to state
+
+    Returns:
+        Completion percentage (0-100)
+    """
+    if not task_states:
+        return 0
+
+    completed_count = sum(1 for state in task_states.values() if state == "success")
+    total_tasks = len(TASK_ORDER)
+
+    return int((completed_count / total_tasks) * 100)
+
+
+def get_dag_run_status(dag_run_id: str) -> Tuple[str, dict]:
+    """
+    Get status of a DAG run.
+
+    Args:
+        dag_run_id: DAG run identifier
+
+    Returns:
+        Tuple of (status_message, dag_run_info)
+    """
+    try:
+        url = f"{AIRFLOW_URL}/api/v1/dags/doc_processor/dagRuns/{dag_run_id}"
+
+        with httpx.Client(timeout=30.0) as client:
+            response = client.get(
+                url,
+                auth=(AIRFLOW_ADMIN_USER, AIRFLOW_ADMIN_PASSWORD),
+            )
+
+            if response.status_code == 200:
+                result = response.json()
+                state = result.get("state", "unknown")
+
+                status_emoji = {
+                    "success": "✓",
+                    "running": "⋯",
+                    "failed": "✗",
+                    "queued": "○",
+                }.get(state, "?")
+
+                return f"{status_emoji} {state.upper()}", result
+            else:
+                return f"✗ Failed to get status: {response.status_code}", {}
+
+    except Exception as e:
+        return f"✗ Error getting status: {str(e)}", {}
+
+
+def fetch_data_dictionary(job_id: str) -> Tuple[str, str]:
+    """
+    Fetch data dictionary from FastAPI backend.
+
+    Args:
+        job_id: Job ID to construct metadata_id
+
+    Returns:
+        Tuple of (metadata_id, data_dictionary_json)
+    """
+    try:
+        # Construct metadata_id from job_id
+        metadata_id = f"META_{job_id}"
+
+        url = f"{os.getenv('FASTAPI_ENDPOINT', 'http://fastapi:8000')}/api/v1/metadata/data-dictionary/{metadata_id}"
+
+        with httpx.Client(timeout=30.0) as client:
+            response = client.get(url)
+
+            if response.status_code == 200:
+                result = response.json()
+                formatted_json = json.dumps(result, indent=2)
+                return metadata_id, formatted_json
+            else:
+                return metadata_id, json.dumps({"error": f"Failed to fetch data dictionary: {response.status_code}"}, indent=2)
+
+    except Exception as e:
+        return "", json.dumps({"error": str(e)}, indent=2)
+
+
+def process_document(user_input: str, progress=gr.Progress()):
+    """
+    Process user input and trigger document processing with progress tracking.
+
+    Args:
+        user_input: Natural language input from user
+        progress: Gradio progress tracker
+
+    Yields:
+        Tuple of (status, details, progress_display, dag_run_info_json, metadata_id, data_dict_json)
+    """
+    if not user_input or not user_input.strip():
+        yield "Error", "Please provide a document name or command.", "", "{}", "", "{}"
+        return
+
+    # Parse document name
+    document_name = parse_document_name(user_input)
+
+    if not document_name:
+        yield "Error", f"Could not identify a document name in your input.\n\nPlease specify a document name with extension (e.g., 'Start processing mydoc.docx')", "", "{}", "", "{}"
+        return
+
+    progress(0, desc="Triggering DAG...")
+
+    # Trigger DAG
+    success, message, dag_info = trigger_airflow_dag(document_name)
+
+    if not success:
+        yield "Error", message, "", "{}", "", "{}"
+        return
+
+    dag_run_id = dag_info.get("dag_run_id")
+    job_id = dag_info.get("conf", {}).get("job_id", "")
+
+    # Initial state
+    initial_progress = "\n".join([f"○ {TASK_NAMES[task_id]}" for task_id in TASK_ORDER])
+    yield "In Progress (0%)", "", initial_progress, json.dumps(dag_info, indent=2), "", "{}"
+
+    time.sleep(2)
+
+    # Poll for task progress
+    max_polls = 60  # 60 polls = ~2 minutes
+    poll_count = 0
+    last_task_states = {}
+    last_progress_text = initial_progress
+    last_percentage = 0
+
+    while poll_count < max_polls:
+        # Get task states
+        task_states = get_task_instances(dag_run_id)
+
+        # Only update if states changed (prevent flickering)
+        if task_states != last_task_states:
+            last_task_states = task_states.copy()
+            last_progress_text = format_progress(task_states)
+            last_percentage = calculate_completion_percentage(task_states)
+
+        # Get overall DAG status
+        dag_status, dag_details = get_dag_run_status(dag_run_id)
+        dag_state = dag_details.get("state", "running")
+
+        # Update progress bar
+        progress((poll_count + 1) / max_polls, desc=f"Processing ({dag_state})...")
+
+        # Check if DAG is complete
+        if dag_state in ["success", "failed"]:
+            final_status = "Completed (100%)" if dag_state == "success" else f"Failed ({last_percentage}%)"
+
+            # Fetch data dictionary on success
+            metadata_id = ""
+            data_dict_json = "{}"
+            if dag_state == "success" and job_id:
+                metadata_id, data_dict_json = fetch_data_dictionary(job_id)
+
+            yield final_status, message, last_progress_text, json.dumps(dag_info, indent=2), metadata_id, data_dict_json
+            return
+
+        # Yield intermediate result (only if something changed)
+        status_text = f"In Progress ({last_percentage}%)"
+        yield status_text, "", last_progress_text, json.dumps(dag_info, indent=2), "", "{}"
+
+        time.sleep(2)
+        poll_count += 1
+
+    # Timeout - final check
+    task_states = get_task_instances(dag_run_id)
+    progress_text = format_progress(task_states)
+    percentage = calculate_completion_percentage(task_states)
+    dag_status, dag_details = get_dag_run_status(dag_run_id)
+    dag_state = dag_details.get("state", "running")
+
+    if dag_state in ["success", "failed"]:
+        final_status = "Completed (100%)" if dag_state == "success" else f"Failed ({percentage}%)"
+
+        # Fetch data dictionary on success
+        metadata_id = ""
+        data_dict_json = "{}"
+        if dag_state == "success" and job_id:
+            metadata_id, data_dict_json = fetch_data_dictionary(job_id)
+
+        yield final_status, message, progress_text, json.dumps(dag_info, indent=2), metadata_id, data_dict_json
+    else:
+        yield f"Still Running ({percentage}%)", "", progress_text, json.dumps(dag_info, indent=2), "", "{}"
+
+
+def create_document_processor_interface():
+    """
+    Create document processing interface.
+
+    Returns:
+        gr.Column: Document processor interface components
+    """
+    with gr.Column():
+        # User input
+        user_input = gr.Textbox(
+            label="Command",
+            placeholder="Start processing <document-name.docx>",
+            lines=2,
+        )
+
+        process_btn = gr.Button("Go", variant="primary", size="lg")
+
+        # Progress display (Claude-style)
+        progress_output = gr.Textbox(
+            label="Progress",
+            lines=6,
+            interactive=False,
+            show_label=True,
+        )
+
+        # Status display
+        with gr.Row():
+            status_output = gr.Textbox(
+                label="Status",
+                lines=1,
+                interactive=False,
+            )
+
+        # Details display
+        details_output = gr.Textbox(
+            label="Details",
+            lines=8,
+            interactive=False,
+        )
+
+        # DAG run info (collapsible)
+        with gr.Accordion("Run Information", open=False):
+            dag_info_output = gr.Code(
+                label="Details",
+                language="json",
+                lines=10,
+            )
+
+        # Data Dictionary section (collapsible)
+        with gr.Accordion("Data Dictionary", open=False):
+            metadata_id_output = gr.Textbox(
+                label="Metadata ID",
+                lines=1,
+                interactive=False,
+            )
+            data_dict_output = gr.Code(
+                label="Sample Fields (5 fields: 1 header, 1 trailer, 2+ body)",
+                language="json",
+                lines=15,
+                interactive=False,
+            )
+
+        # Wire up event handler with streaming progress
+        process_btn.click(
+            fn=process_document,
+            inputs=[user_input],
+            outputs=[status_output, details_output, progress_output, dag_info_output, metadata_id_output, data_dict_output],
+        )
+
+    return gr.Column()
